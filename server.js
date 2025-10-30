@@ -3,130 +3,116 @@ const express = require("express");
 const cors = require("cors");
 const bodyParser = require("body-parser");
 const fs = require("fs");
+const path = require("path");
 
 const app = express();
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 
 // Middleware
 app.use(cors());
 app.use(bodyParser.json());
 
-// Beheerder-token
-const ADMIN_TOKEN = "39f90f0a9ab0145b";
+// Path naar users.json
+const USERS_FILE = path.join(__dirname, "users.json");
 
-// Simpele "database" in JSON
-const DATA_FILE = "./users.json";
-
-// Helper functies
-function loadUsers() {
-  try {
-    if (!fs.existsSync(DATA_FILE)) {
-      fs.writeFileSync(DATA_FILE, "[]");
-      return [];
-    }
-    const raw = fs.readFileSync(DATA_FILE);
-    return JSON.parse(raw);
-  } catch (err) {
-    console.error("Fout bij het lezen van users.json:", err);
-    return [];
-  }
+// Helpers
+function readUsers() {
+  if (!fs.existsSync(USERS_FILE)) return [];
+  const data = fs.readFileSync(USERS_FILE, "utf8");
+  return JSON.parse(data || "[]");
 }
 
-function saveUsers(users) {
-  try {
-    fs.writeFileSync(DATA_FILE, JSON.stringify(users, null, 2));
-  } catch (err) {
-    console.error("Fout bij opslaan users.json:", err);
-  }
+function writeUsers(users) {
+  fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2));
 }
 
-
-function generateToken() {
-  return Math.random().toString(36).substring(2,12) + Math.random().toString(36).substring(2,12);
-}
-
-// Punten berekenen (weken sinds last_reset)
-function updatePandapunten(users){
+// Bereken pandapunten (weken sinds laatste reset)
+function getPandapunten(user) {
+  const lastReset = new Date(user.last_reset);
   const now = new Date();
-  return users.map(u => {
-    const diff = now - new Date(u.last_reset);
-    u.pandapunten = Math.floor(diff / (7*24*60*60*1000)); // 1 punt per week
-    return u;
-  });
+  const diffMs = now - lastReset;
+  const diffWeeks = Math.floor(diffMs / (1000 * 60 * 60 * 24 * 7));
+  return diffWeeks;
 }
 
 // Routes
-
-// Alle gebruikers ophalen
-app.get("/api/users", (req,res)=>{
-  let users = loadUsers();
-  users = updatePandapunten(users);
-  saveUsers(users);
+app.get("/api/users", (req, res) => {
+  const users = readUsers().map(u => ({
+    name: u.name,
+    token: u.token,
+    pandapunten: getPandapunten(u),
+    last_reset: u.last_reset
+  }));
   res.json(users);
 });
 
-// Nieuwe gebruiker toevoegen (admin)
-app.post("/api/users", (req,res)=>{
-  const adminToken = req.header("x-admin-token");
-  if(adminToken !== ADMIN_TOKEN) return res.status(403).json({error:"Alleen beheerder kan toevoegen"});
+// Admin middleware
+function checkAdmin(req, res, next) {
+  const adminToken = req.headers["x-admin-token"];
+  if (adminToken !== "39f90f0a9ab0145b") {
+    return res.status(403).json({ error: "Alleen admin mag dit doen" });
+  }
+  next();
+}
 
-  const {name, startDate} = req.body;
-  const users = loadUsers();
+// Voeg gebruiker toe
+app.post("/api/users", checkAdmin, (req, res) => {
+  const { name, startDate } = req.body;
+  if (!name || !startDate) return res.status(400).json({ error: "Naam en startdatum verplicht" });
 
-  const token = generateToken();
-  const last_reset = startDate ? new Date(startDate) : new Date();
-  const pandapunten = 0;
+  const users = readUsers();
+  // genereer simpele token (UUID kan ook)
+  const token = Math.random().toString(36).substring(2, 12);
+  users.push({ name, token, last_reset: startDate });
+  writeUsers(users);
 
-  const newUser = {name, token, last_reset, pandapunten};
-  users.push(newUser);
-  saveUsers(users);
-  res.json(newUser);
+  res.json({ ok: true, token });
 });
 
-// Gebruiker verwijderen (admin)
-app.delete("/api/users/:token", (req,res)=>{
-  const adminToken = req.header("x-admin-token");
-  if(adminToken !== ADMIN_TOKEN) return res.status(403).json({error:"Alleen beheerder mag verwijderen"});
+// Verwijder gebruiker
+app.delete("/api/users/:token", checkAdmin, (req, res) => {
+  const token = req.params.token;
+  let users = readUsers();
+  const beforeCount = users.length;
+  users = users.filter(u => u.token !== token);
+  writeUsers(users);
 
-  const {token} = req.params;
-  let users = loadUsers();
-  const index = users.findIndex(u => u.token === token);
-  if(index === -1) return res.status(404).json({error:"Gebruiker niet gevonden"});
-  const removed = users.splice(index,1)[0];
-  saveUsers(users);
-  res.json({message:`${removed.name} verwijderd`});
+  if (users.length === beforeCount) return res.status(404).json({ error: "Gebruiker niet gevonden" });
+  res.json({ ok: true, message: "Gebruiker verwijderd" });
 });
 
-// Resetdatum aanpassen (admin)
-app.put("/api/users/:token/resetdate", (req,res)=>{
-  const adminToken = req.header("x-admin-token");
-  if(adminToken !== ADMIN_TOKEN) return res.status(403).json({error:"Alleen beheerder kan resetdatum aanpassen"});
+// Pas resetdatum aan
+app.put("/api/users/:token/resetdate", checkAdmin, (req, res) => {
+  const token = req.params.token;
+  const { newDate } = req.body;
+  if (!newDate) return res.status(400).json({ error: "Nieuwe datum verplicht" });
 
-  const {token} = req.params;
-  const {newDate} = req.body;
-  const users = loadUsers();
+  const users = readUsers();
   const user = users.find(u => u.token === token);
-  if(!user) return res.status(404).json({error:"Gebruiker niet gevonden"});
+  if (!user) return res.status(404).json({ error: "Gebruiker niet gevonden" });
 
-  user.last_reset = new Date(newDate);
-  saveUsers(users);
-  res.json({message:`Resetdatum van ${user.name} aangepast`});
+  user.last_reset = newDate;
+  writeUsers(users);
+
+  res.json({ ok: true, message: "Resetdatum aangepast" });
 });
 
-// Zelf resetten (gebruiker)
-app.post("/api/reset", (req,res)=>{
-  const {token} = req.body;
-  if(!token) return res.status(400).json({error:"Geen token"});
-  const users = loadUsers();
-  const user = users.find(u=>u.token === token);
-  if(!user) return res.status(404).json({error:"Gebruiker niet gevonden"});
+// Reset eigen pandapunten
+app.post("/api/reset", (req, res) => {
+  const { token } = req.body;
+  if (!token) return res.status(400).json({ error: "Token verplicht" });
 
-  user.last_reset = new Date();
-  saveUsers(users);
-  res.json({message:`${user.name} is gereset`});
+  const users = readUsers();
+  const user = users.find(u => u.token === token);
+  if (!user) return res.status(404).json({ error: "Token ongeldig" });
+
+  user.last_reset = new Date().toISOString();
+  writeUsers(users);
+
+  res.json({ ok: true, message: "Reset succesvol" });
 });
 
 // Start server
-app.listen(PORT, ()=>{
-  console.log(`Server draait op http://localhost:${PORT}`);
+app.listen(PORT, () => {
+  console.log(`Server draait op poort ${PORT}`);
 });
